@@ -37,5 +37,5 @@ crontab -e
 Input the following value:
 
 ```
-*/15 * * * * /path/to/python /path/to/CitrixDaaSHarvester.py
+*/10 * * * * /path/to/python /path/to/CitrixDaaSHarvester.py
 ```
