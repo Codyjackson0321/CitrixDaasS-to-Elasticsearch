@@ -4,9 +4,10 @@ from dotenv import dotenv_values
 from datetime import datetime, timedelta, UTC
 import requests
 import json
+import argparse
 
 class CitrixDaasToElasticsearch:
-    def __init__(self):
+    def __init__(self, sync_mode=False):
         self.config = dotenv_values(".env")
         self.api_url = f"https://api.cloud.com/"
         self.headers = {
@@ -20,6 +21,7 @@ class CitrixDaasToElasticsearch:
         self.data_stream_name = "logs-citrix.daas-default"
         self.access_token = ""
         self.current_time = datetime.now(UTC)
+        self.sync_mode = sync_mode
 
     def get_token(self):
         r = requests.post(
@@ -38,7 +40,11 @@ class CitrixDaasToElasticsearch:
         self.headers['Authorization'] = self.access_token_citrix[0]
         self.headers['Citrix-CustomerId'] = self.config['CUSTOMER_ID']
 
-        start = self.current_time - timedelta(minutes=11)
+        # Use maximum range for sync mode, otherwise 11 minutes for polling
+        if self.sync_mode:
+            start = self.current_time - timedelta(days=3650)  # ~10 years max
+        else:
+            start = self.current_time - timedelta(minutes=11)
         start_str = start.strftime("%Y-%m-%dT%H:%M:%S")
 
         response = requests.get(
@@ -67,15 +73,13 @@ class CitrixDaasToElasticsearch:
             self.api_url + "cvad/manage/ConfigLog/Operations",
             headers=self.headers,
             params={
-                "days": 1,  # Change to 1 for 1 day, or adjust as needed
+                "days": 365 if self.sync_mode else 1,
                 "limit": 1000  # Maximum number of results to return
             }
         )
 
-
         processed_logs = self.process_logs(response.json()['Items'], "citrix_daas")
         self.write_logs(processed_logs)
-
 
     def get_logs_user_sessions(self):
         self.headers = {
@@ -85,7 +89,11 @@ class CitrixDaasToElasticsearch:
         self.headers['Authorization'] = self.access_token_odata[0]
         self.headers['Citrix-CustomerId'] = self.config['CUSTOMER_ID']
 
-        start = self.current_time - timedelta(minutes=11)
+        # Use maximum range for sync mode, otherwise 11 minutes for polling
+        if self.sync_mode:
+            start = self.current_time - timedelta(days=365)
+        else:
+            start = self.current_time - timedelta(minutes=11)
         start_str = start.strftime("%Y-%m-%dT%H:%M:%SZ")
 
         # Get sessions that started or ended in the last 11 minutes
@@ -138,7 +146,7 @@ class CitrixDaasToElasticsearch:
                     doc['_source']['@timestamp'] = log['utcTimestamp']
 
             elif category == "citrix_daas":
-                print(log)
+                #print(log)
                 if 'Id' in log:
                     doc['_id'] = log['Id']
                 if "User" in log:
@@ -210,7 +218,12 @@ class CitrixDaasToElasticsearch:
                     print(f"Error detail: {error}")
 
 def main():
-    citrix = CitrixDaasToElasticsearch()
+    parser = argparse.ArgumentParser(description='Harvest Citrix DaaS logs to Elasticsearch')
+    parser.add_argument('--sync', action='store_true', 
+                        help='Enable sync mode to fetch maximum historical data (365 days for DaaS, ~10 years for Cloud)')
+    args = parser.parse_args()
+
+    citrix = CitrixDaasToElasticsearch(sync_mode=args.sync)
     citrix.get_token()
     citrix.get_logs_citrix_cloud()
     citrix.get_logs_citrix_daas()

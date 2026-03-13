@@ -25,6 +25,13 @@ SITE_ID
 - elasticsearch
 - dotenv
 
+### Flags
+Normal usage is just to run the script
+
+You can run the script with `--sync` to pull in the last year of data
+```bash
+python CitrixDaaSHarvester.py --sync
+```
 
 ### Setup
 To keep things simple, we just run this on a cron job.
