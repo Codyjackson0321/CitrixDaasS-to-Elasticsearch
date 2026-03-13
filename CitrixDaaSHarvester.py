@@ -37,8 +37,11 @@ class CitrixDaasToElasticsearch:
         self.access_token_odata = f"CWSAuth Bearer={r.json()['access_token']}",
 
     def get_logs_citrix_cloud(self):
-        self.headers['Authorization'] = self.access_token_citrix[0]
-        self.headers['Citrix-CustomerId'] = self.config['CUSTOMER_ID']
+        headers = {
+            "accept": "application/json",
+            "Authorization": self.access_token_citrix[0],
+            "Citrix-CustomerId": self.config['CUSTOMER_ID']
+        }
 
         # Use maximum range for sync mode, otherwise 11 minutes for polling
         if self.sync_mode:
@@ -49,7 +52,7 @@ class CitrixDaasToElasticsearch:
 
         response = requests.get(
             self.api_url + "systemlog/records",
-            headers=self.headers,
+            headers=headers,
             params={
                 "StartDateTime": start_str,
             }
@@ -59,35 +62,44 @@ class CitrixDaasToElasticsearch:
         self.write_logs(processed_logs)
 
     def get_logs_citrix_daas(self):
-        self.headers = {
+        headers = {
             "accept": "application/json",
             "Content-Type": "application/json",
+            "Authorization": self.access_token_citrix[0],
+            "Citrix-CustomerId": self.config['CUSTOMER_ID'],
+            "Citrix-InstanceId": self.config['SITE_ID']
         }
-        self.headers['Authorization'] = self.access_token_citrix[0]
-        self.headers['Citrix-CustomerId'] = self.config['CUSTOMER_ID']
-        self.headers['Citrix-InstanceId'] = self.config['SITE_ID']
 
         # Use GET endpoint with 'days' parameter for date filtering
         # The API doesn't support date filtering via SearchFilters in POST $search
         response = requests.get(
             self.api_url + "cvad/manage/ConfigLog/Operations",
-            headers=self.headers,
+            headers=headers,
             params={
-                "days": 365 if self.sync_mode else 1,
+                "days": 365 if self.sync_mode else 40,
                 "limit": 1000  # Maximum number of results to return
             }
         )
 
-        processed_logs = self.process_logs(response.json()['Items'], "citrix_daas")
-        self.write_logs(processed_logs)
+        if response.status_code == 200:
+            data = response.json()
+            if 'Items' in data and len(data['Items']) > 0:
+                processed_logs = self.process_logs(data['Items'], "citrix_daas")
+                self.write_logs(processed_logs)
+                print(f"Processed {len(data['Items'])} DaaS config logs")
+            else:
+                print(f"No DaaS config logs found in response. Response keys: {data.keys() if data else 'empty'}")
+        else:
+            print(f"Error fetching DaaS config logs: {response.status_code}")
+            print(f"Response: {response.text}")
 
     def get_logs_user_sessions(self):
-        self.headers = {
+        headers = {
             "accept": "application/json",
             "Content-Type": "application/json",
+            "Authorization": self.access_token_odata[0],
+            "Citrix-CustomerId": self.config['CUSTOMER_ID']
         }
-        self.headers['Authorization'] = self.access_token_odata[0]
-        self.headers['Citrix-CustomerId'] = self.config['CUSTOMER_ID']
 
         # Use maximum range for sync mode, otherwise 11 minutes for polling
         if self.sync_mode:
@@ -96,10 +108,10 @@ class CitrixDaasToElasticsearch:
             start = self.current_time - timedelta(minutes=11)
         start_str = start.strftime("%Y-%m-%dT%H:%M:%SZ")
 
-        # Get sessions that started or ended in the last 11 minutes
+        # Get sessions that started or ended in the time range
         response = requests.get(
             self.api_url + "monitorodata/Sessions",
-            headers=self.headers,
+            headers=headers,
             params={
                 "$filter": f"StartDate ge {start_str} or EndDate ge {start_str}",
                 "$expand": "User,Machine"
@@ -107,8 +119,19 @@ class CitrixDaasToElasticsearch:
         )
 
         if response.status_code == 200:
-            processed_logs = self.process_logs(response.json()['value'], "user_sessions")
-            self.write_logs(processed_logs)
+            data = response.json()
+            sessions = data.get('value', [])
+            print(f"Fetched {len(sessions)} user sessions from API")
+            
+            # Check if there's a continuation token for pagination
+            if '@odata.nextLink' in data:
+                print(f"WARNING: More sessions available (pagination detected). Only processing first batch.")
+            
+            if sessions:
+                processed_logs = self.process_logs(sessions, "user_sessions")
+                self.write_logs(processed_logs)
+            else:
+                print("No user sessions found in the specified time range")
         else:
             print(f"Error fetching user sessions: {response.status_code}")
             print(response.text)
@@ -116,6 +139,14 @@ class CitrixDaasToElasticsearch:
     def process_logs(self, logs, category):
         parsed_logs = []
         for log in logs:
+            # Make a copy of the log to avoid modifying the original
+            log_copy = log.copy()
+            
+            # For user_sessions, rewrite the User object to just the username string
+            if category == "user_sessions" and 'User' in log_copy and isinstance(log_copy['User'], dict):
+                user_name = log_copy['User'].get('UserName') or log_copy['User'].get('Upn') or 'unknown'
+                log_copy['User'] = user_name
+            
             doc = {
                 "_op_type": "create",
                 "_index": self.data_stream_name,
@@ -124,7 +155,7 @@ class CitrixDaasToElasticsearch:
                         "original": json.dumps(log),
                         "category": category
                     },
-                    "citrix": log
+                    "citrix": log_copy
                 }
             }
 
@@ -146,7 +177,6 @@ class CitrixDaasToElasticsearch:
                     doc['_source']['@timestamp'] = log['utcTimestamp']
 
             elif category == "citrix_daas":
-                #print(log)
                 if 'Id' in log:
                     doc['_id'] = log['Id']
                 if "User" in log:
@@ -158,7 +188,14 @@ class CitrixDaasToElasticsearch:
                     doc['_source']['event']['action'] = log['OperationType']
 
                 if "StartTime" in log:
-                    doc['_source']['@timestamp'] = log['StartTime']
+                    # Convert from "MM/DD/YYYY h:mm:ss AM/PM" to ISO 8601
+                    try:
+                        from datetime import datetime
+                        dt = datetime.strptime(log['StartTime'], "%m/%d/%Y %I:%M:%S %p")
+                        doc['_source']['@timestamp'] = dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+                    except Exception as e:
+                        print(f"Error parsing StartTime '{log['StartTime']}': {e}")
+                        doc['_source']['@timestamp'] = log['StartTime']
 
                 if "Text" in log:
                     doc['_source']['message'] = log['Text']
@@ -166,7 +203,7 @@ class CitrixDaasToElasticsearch:
             elif category == "user_sessions":
                 if 'SessionKey' in log:
                     doc['_id'] = log['SessionKey']
-                
+
                 # Determine event action based on session state
                 if log.get('EndDate'):
                     doc['_source']['event']['action'] = 'user-logoff'
@@ -176,15 +213,19 @@ class CitrixDaasToElasticsearch:
                     doc['_source']['event']['action'] = 'user-login'
                     doc['_source']['@timestamp'] = log['StartDate']
                     doc['_source']['message'] = f"User session started"
-                
-                # User information
+
+                # User information - check multiple possible fields
+                user_name = None
                 if 'User' in log and log['User']:
                     user_name = log['User'].get('UserName') or log['User'].get('Upn')
-                    if user_name:
-                        doc['_source']['user'] = {
-                            "name": user_name,
-                            "related": [user_name]
-                        }
+                elif 'AssociatedUserFullNames' in log and log['AssociatedUserFullNames']:
+                    user_name = log['AssociatedUserFullNames'][0] if isinstance(log['AssociatedUserFullNames'], list) else log['AssociatedUserFullNames']
+                
+                if user_name:
+                    doc['_source']['user'] = {
+                        "name": user_name,
+                        "related": [user_name]
+                    }
                 
                 # Machine/host information
                 if 'Machine' in log and log['Machine']:
@@ -192,25 +233,32 @@ class CitrixDaasToElasticsearch:
                         doc['_source']['host'] = {
                             "name": log['Machine']['DnsName']
                         }
-                
-                # Session details
-                if 'SessionType' in log:
-                    session_types = {0: 'Application', 1: 'Desktop'}
-                    doc['_source']['citrix']['session_type'] = session_types.get(log['SessionType'], 'Unknown')
-                
-                if 'ConnectionState' in log:
-                    connection_states = {0: 'Unknown', 1: 'Connected', 2: 'Disconnected', 3: 'Terminated', 4: 'PreparingSession', 5: 'Active', 6: 'Reconnecting', 7: 'NonBrokeredSession', 8: 'Other', 9: 'Pending'}
-                    doc['_source']['citrix']['connection_state'] = connection_states.get(log['ConnectionState'], 'Unknown')
 
             parsed_logs.append(doc)
         return parsed_logs
 
     def write_logs(self, logs):
+        if not logs:
+            print("No logs to write")
+            return
+        
+        success_count = 0
+        duplicate_count = 0
+        error_count = 0
+        
         try:
             for success, info in parallel_bulk(self.es, actions=logs, raise_on_error=False):
-                # Ignore 409s
-                if not success and not info['create']['status'] == 409:
-                    print(f"Failed to index document: {info}")
+                if success:
+                    success_count += 1
+                else:
+                    # Check if it's a duplicate (409 conflict)
+                    if info.get('create', {}).get('status') == 409:
+                        duplicate_count += 1
+                    else:
+                        error_count += 1
+                        print(f"Failed to index document: {info}")
+            
+            print(f"Indexing complete - Success: {success_count}, Duplicates: {duplicate_count}, Errors: {error_count}")
         except Exception as e:
             print(f"Error during bulk indexing: {e}")
             if hasattr(e, 'errors'):
